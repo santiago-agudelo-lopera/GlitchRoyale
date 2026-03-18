@@ -12,7 +12,7 @@ type WSHandler struct {
 	hub *Hub
 }
 
-// 🔹 Estado global (simple para demo)
+// 🔹 Estado global (demo)
 var players = make(map[string]int)   // tokens
 var playersHP = make(map[string]int) // HP
 
@@ -62,6 +62,16 @@ func (h *WSHandler) HandleConnections(w http.ResponseWriter, r *http.Request) {
 
 	h.hub.Register <- client
 
+	// 🔥 evento jugador conectado
+	h.broadcast(map[string]interface{}{
+		"type": "PLAYER_JOINED",
+		"data": map[string]interface{}{
+			"playerId": playerID,
+			"hp":       100,
+			"tokens":   0,
+		},
+	})
+
 	go h.readPump(client)
 	go h.writePump(client)
 }
@@ -106,18 +116,21 @@ func (h *WSHandler) writePump(c *Client) {
 	}
 }
 
+// 🔹 Helper broadcast
+func (h *WSHandler) broadcast(payload interface{}) {
+	b, _ := json.Marshal(payload)
+	h.hub.Broadcast <- b
+}
+
 // 🔹 Enviar pregunta
 func (h *WSHandler) sendQuestion() {
-	resp := map[string]interface{}{
+	h.broadcast(map[string]interface{}{
 		"type": "QUESTION",
 		"data": map[string]interface{}{
 			"question": "2+2",
 			"options":  []string{"3", "4", "5"},
 		},
-	}
-
-	b, _ := json.Marshal(resp)
-	h.hub.Broadcast <- b
+	})
 }
 
 // 🔹 Manejar respuesta
@@ -134,8 +147,9 @@ func (h *WSHandler) handleAnswer(c *Client, data []byte) {
 	resp := map[string]interface{}{
 		"type": "RESULT",
 		"data": map[string]interface{}{
-			"correct": correct,
-			"tokens":  players[c.ID],
+			"playerId": c.ID,
+			"correct":  correct,
+			"tokens":   players[c.ID],
 		},
 	}
 
@@ -150,7 +164,6 @@ func (h *WSHandler) handleAttack(c *Client, data []byte) {
 
 	damage := 10
 
-	// validar target
 	hp, ok := playersHP[atk.Target]
 	if !ok {
 		return
@@ -163,7 +176,8 @@ func (h *WSHandler) handleAttack(c *Client, data []byte) {
 
 	playersHP[atk.Target] = hp
 
-	resp := map[string]interface{}{
+	// 🔥 resultado ataque
+	h.broadcast(map[string]interface{}{
 		"type": "ATTACK_RESULT",
 		"data": map[string]interface{}{
 			"from":   c.ID,
@@ -171,8 +185,15 @@ func (h *WSHandler) handleAttack(c *Client, data []byte) {
 			"damage": damage,
 			"hp":     hp,
 		},
-	}
+	})
 
-	b, _ := json.Marshal(resp)
-	h.hub.Broadcast <- b
+	// 💀 eliminación
+	if hp == 0 {
+		h.broadcast(map[string]interface{}{
+			"type": "PLAYER_ELIMINATED",
+			"data": map[string]interface{}{
+				"playerId": atk.Target,
+			},
+		})
+	}
 }
