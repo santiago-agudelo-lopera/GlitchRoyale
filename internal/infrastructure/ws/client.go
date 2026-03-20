@@ -1,12 +1,13 @@
 package ws
 
-import (
-	"github.com/gorilla/websocket"
-)
+import "github.com/gorilla/websocket"
 
 type Client struct {
-	ID     string
-	Conn   *websocket.Conn
-	Send   chan []byte
-	GameID string
+	ID       string
+	Name     string
+	HP       int
+	Tokens   int
+	Conn     *websocket.Conn
+	Send     chan []byte
+	RoomCode string
 }

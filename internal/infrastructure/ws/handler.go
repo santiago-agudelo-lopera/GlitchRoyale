@@ -1,23 +1,53 @@
 package ws
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	questionsvc "GlitchRoyale/internal/infrastructure/questions"
 
 	"github.com/gorilla/websocket"
 )
 
-type WSHandler struct {
-	hub *Hub
+const questionFetchTimeout = 5 * time.Second
+
+type QuestionService interface {
+	GetRandomQuestion(ctx context.Context) (questionsvc.Question, error)
 }
 
-// 🔹 Estado global (demo)
-var players = make(map[string]int)   // tokens
-var playersHP = make(map[string]int) // HP
+type WSHandler struct {
+	hub             *Hub
+	questionService QuestionService
+}
 
-func NewWSHandler(hub *Hub) *WSHandler {
-	return &WSHandler{hub: hub}
+type Message struct {
+	Type     string `json:"type"`
+	Code     string `json:"code,omitempty"`
+	Name     string `json:"name,omitempty"`
+	AnswerID string `json:"answerId,omitempty"`
+	TargetID string `json:"targetId,omitempty"`
+}
+
+type RoomCreatedResponse struct {
+	Type string `json:"type"`
+	Code string `json:"code"`
+}
+
+type AnswerResultResponse struct {
+	Type    string `json:"type"`
+	Correct bool   `json:"correct"`
+	Tokens  int    `json:"tokens"`
+}
+
+type ErrorResponse struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
 }
 
 var upgrader = websocket.Upgrader{
@@ -26,174 +56,219 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-// 🔹 Mensajes
-type Message struct {
-	Type string          `json:"type"`
-	Data json.RawMessage `json:"data"`
+var playerSequence atomic.Uint64
+
+func NewWSHandler(hub *Hub, questionService QuestionService) *WSHandler {
+	return &WSHandler{hub: hub, questionService: questionService}
 }
 
-type Answer struct {
-	Answer string `json:"answer"`
-}
-
-type Attack struct {
-	Target string `json:"target"`
-}
-
-// 🔹 Conexión
 func (h *WSHandler) HandleConnections(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println(err)
+		log.Println("error upgrading websocket:", err)
 		return
 	}
 
-	playerID := r.URL.Query().Get("playerId")
+	playerID := nextPlayerID()
+
+	playerName := normalizePlayerName(r.URL.Query().Get("name"))
 
 	client := &Client{
-		ID:   playerID,
-		Conn: conn,
-		Send: make(chan []byte),
+		ID:     playerID,
+		Name:   playerName,
+		HP:     initialPlayerHP,
+		Tokens: initialPlayerTokens,
+		Conn:   conn,
+		Send:   make(chan []byte, 256),
 	}
 
-	// inicializar estado
-	players[playerID] = 0
-	playersHP[playerID] = 100
-
 	h.hub.Register <- client
-
-	// 🔥 evento jugador conectado
-	h.broadcast(map[string]interface{}{
-		"type": "PLAYER_JOINED",
-		"data": map[string]interface{}{
-			"playerId": playerID,
-			"hp":       100,
-			"tokens":   0,
-		},
-	})
+	log.Println("client connected:", client.ID)
 
 	go h.readPump(client)
 	go h.writePump(client)
 }
 
-// 🔹 Leer mensajes
-func (h *WSHandler) readPump(c *Client) {
+func (h *WSHandler) readPump(client *Client) {
 	defer func() {
-		h.hub.Unregister <- c
-		c.Conn.Close()
+		h.hub.Unregister <- client
+		client.Conn.Close()
+		log.Println("client disconnected:", client.ID)
 	}()
 
 	for {
-		_, message, err := c.Conn.ReadMessage()
+		_, payload, err := client.Conn.ReadMessage()
 		if err != nil {
-			break
+			log.Println("error reading websocket:", err)
+			return
 		}
 
-		var msg Message
-		json.Unmarshal(message, &msg)
+		var message Message
+		if err := json.Unmarshal(payload, &message); err != nil {
+			log.Println("error parsing websocket message:", err)
+			h.sendError(client, "invalid_message")
+			continue
+		}
 
-		switch msg.Type {
+		switch message.Type {
+		case "create_room":
+			h.handleCreateRoom(client, message.Name)
 
-		case "START":
-			h.sendQuestion()
+		case "join_room":
+			h.handleJoinRoom(client, message.Code, message.Name)
 
-		case "ANSWER":
-			h.handleAnswer(c, msg.Data)
+		case "start_game":
+			h.handleStartGame(client)
 
-		case "ATTACK":
-			h.handleAttack(c, msg.Data)
+		case "answer":
+			h.handleAnswer(client, message.AnswerID)
+
+		case "attack":
+			h.handleAttack(client, message.TargetID)
+
+		default:
+			log.Println("unknown message type:", message.Type)
+			h.sendError(client, "unknown_message_type")
 		}
 	}
 }
 
-// 🔹 Escribir mensajes
-func (h *WSHandler) writePump(c *Client) {
-	for msg := range c.Send {
-		err := c.Conn.WriteMessage(websocket.TextMessage, msg)
-		if err != nil {
-			break
+func (h *WSHandler) writePump(client *Client) {
+	defer client.Conn.Close()
+
+	for message := range client.Send {
+		if err := client.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			log.Println("error writing websocket:", err)
+			return
 		}
 	}
 }
 
-// 🔹 Helper broadcast
-func (h *WSHandler) broadcast(payload interface{}) {
-	b, _ := json.Marshal(payload)
-	h.hub.Broadcast <- b
-}
-
-// 🔹 Enviar pregunta
-func (h *WSHandler) sendQuestion() {
-	h.broadcast(map[string]interface{}{
-		"type": "QUESTION",
-		"data": map[string]interface{}{
-			"question": "2+2",
-			"options":  []string{"3", "4", "5"},
-		},
-	})
-}
-
-// 🔹 Manejar respuesta
-func (h *WSHandler) handleAnswer(c *Client, data []byte) {
-	var ans Answer
-	json.Unmarshal(data, &ans)
-
-	correct := ans.Answer == "4"
-
-	if correct {
-		players[c.ID]++
-	}
-
-	resp := map[string]interface{}{
-		"type": "RESULT",
-		"data": map[string]interface{}{
-			"playerId": c.ID,
-			"correct":  correct,
-			"tokens":   players[c.ID],
-		},
-	}
-
-	b, _ := json.Marshal(resp)
-	c.Send <- b
-}
-
-// 🔥 Manejar ataque
-func (h *WSHandler) handleAttack(c *Client, data []byte) {
-	var atk Attack
-	json.Unmarshal(data, &atk)
-
-	damage := 10
-
-	hp, ok := playersHP[atk.Target]
-	if !ok {
+func (h *WSHandler) handleCreateRoom(client *Client, name string) {
+	roomCode, err := h.hub.CreateRoomForClient(client, name)
+	if err != nil {
+		log.Println("error creating room:", err)
+		h.sendError(client, "room_creation_failed")
 		return
 	}
 
-	hp -= damage
-	if hp < 0 {
-		hp = 0
+	h.sendJSON(client, RoomCreatedResponse{Type: "room_created", Code: roomCode})
+}
+
+func (h *WSHandler) handleJoinRoom(client *Client, code string, name string) {
+	roomCode := strings.ToUpper(strings.TrimSpace(code))
+	if roomCode == "" {
+		h.sendError(client, "room_code_required")
+		return
 	}
 
-	playersHP[atk.Target] = hp
+	if err := h.hub.JoinRoomForClient(client, roomCode, name); err != nil {
+		if err == ErrRoomNotFound {
+			h.sendError(client, "room_not_found")
+			return
+		}
 
-	// 🔥 resultado ataque
-	h.broadcast(map[string]interface{}{
-		"type": "ATTACK_RESULT",
-		"data": map[string]interface{}{
-			"from":   c.ID,
-			"to":     atk.Target,
-			"damage": damage,
-			"hp":     hp,
-		},
+		log.Println("error joining room:", err)
+		h.sendError(client, "room_join_failed")
+	}
+}
+
+func (h *WSHandler) handleStartGame(client *Client) {
+	if strings.TrimSpace(client.RoomCode) == "" {
+		h.sendError(client, "client_not_in_room")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), questionFetchTimeout)
+	defer cancel()
+
+	question, err := h.questionService.GetRandomQuestion(ctx)
+	if err != nil {
+		log.Println("error fetching question:", err)
+		h.sendError(client, "question_fetch_failed")
+		return
+	}
+
+	if err := h.hub.StartGameForClient(client, question); err != nil {
+		log.Println("error starting game:", err)
+		h.sendError(client, h.mapHubError(err))
+	}
+}
+
+func (h *WSHandler) handleAnswer(client *Client, answerID string) {
+	normalizedAnswerID := strings.TrimSpace(answerID)
+	if normalizedAnswerID == "" {
+		h.sendError(client, "answer_id_required")
+		return
+	}
+
+	result := h.hub.SubmitAnswerForClient(client, normalizedAnswerID)
+	if result.Err != nil {
+		h.sendError(client, h.mapHubError(result.Err))
+		return
+	}
+
+	h.sendJSON(client, AnswerResultResponse{
+		Type:    "answer_result",
+		Correct: result.Correct,
+		Tokens:  result.Tokens,
 	})
+}
 
-	// 💀 eliminación
-	if hp == 0 {
-		h.broadcast(map[string]interface{}{
-			"type": "PLAYER_ELIMINATED",
-			"data": map[string]interface{}{
-				"playerId": atk.Target,
-			},
-		})
+func (h *WSHandler) handleAttack(client *Client, targetID string) {
+	normalizedTargetID := strings.TrimSpace(targetID)
+	if normalizedTargetID == "" {
+		h.sendError(client, "target_id_required")
+		return
 	}
+
+	if err := h.hub.AttackPlayerForClient(client, normalizedTargetID); err != nil {
+		h.sendError(client, h.mapHubError(err))
+	}
+}
+
+func (h *WSHandler) mapHubError(err error) string {
+	switch err {
+	case ErrRoomNotFound:
+		return "room_not_found"
+	case ErrClientNotInRoom:
+		return "client_not_in_room"
+	case ErrNoActiveQuestion:
+		return "no_active_question"
+	case ErrAnswerAlreadySent:
+		return "answer_already_sent"
+	case ErrInvalidAnswerOption:
+		return "invalid_answer_option"
+	case ErrNotEnoughTokens:
+		return "not_enough_tokens"
+	case ErrTargetNotFound:
+		return "target_not_found"
+	case ErrCannotAttackYourself:
+		return "cannot_attack_yourself"
+	case ErrPlayerAlreadyDefeated:
+		return "player_already_defeated"
+	case ErrGameAlreadyFinished:
+		return "game_over"
+	default:
+		return "internal_error"
+	}
+}
+
+func (h *WSHandler) sendError(client *Client, message string) {
+	h.sendJSON(client, ErrorResponse{Type: "error", Message: message})
+}
+
+func (h *WSHandler) sendJSON(client *Client, payload interface{}) {
+	message, err := json.Marshal(payload)
+	if err != nil {
+		log.Println("error marshalling websocket payload:", err)
+		return
+	}
+
+	client.Send <- message
+}
+
+func nextPlayerID() string {
+	value := playerSequence.Add(1)
+	return fmt.Sprintf("player-%d", value)
 }
