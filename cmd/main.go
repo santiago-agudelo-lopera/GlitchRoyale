@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net/http"
+	"os"
 
 	"GlitchRoyale/internal/application/usecases"
 	"GlitchRoyale/internal/infrastructure/database"
@@ -13,11 +14,18 @@ import (
 )
 
 func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
 	db, err := database.NewPostgresDB()
 	if err != nil {
 		log.Fatalf("failed to connect to postgres: %v", err)
 	}
 	defer db.Close()
+
+	log.Println("postgres connection established")
 
 	questionService := questionsvc.NewService(db)
 
@@ -31,12 +39,20 @@ func main() {
 
 	wsHandler := ws.NewWSHandler(hub, questionService)
 
-	http.HandleFunc("/create", handler.CreateGame)
-	http.HandleFunc("/join", handler.JoinGame)
-	http.HandleFunc("/ws", wsHandler.HandleConnections)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/create", handler.CreateGame)
+	mux.HandleFunc("/join", handler.JoinGame)
+	mux.HandleFunc("/ws", wsHandler.HandleConnections)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
 
-	log.Println("Server running on :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatal(err)
+	address := ":" + port
+
+	log.Println("Servidor corriendo en puerto:", port)
+	if err := http.ListenAndServe(address, mux); err != nil {
+		log.Fatalf("server failed to start: %v", err)
 	}
 }

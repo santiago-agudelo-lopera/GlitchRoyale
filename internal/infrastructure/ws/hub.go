@@ -236,6 +236,7 @@ func (h *Hub) Run() {
 			h.resetPlayerState(request.Client)
 			request.Client.Name = h.buildUniquePlayerName(code, request.Name, request.Client)
 			h.moveClientToRoom(request.Client, code)
+			log.Printf("room created: code=%s owner=%s", code, request.Client.ID)
 			request.Response <- CreateRoomResult{Code: code}
 			h.broadcastRoomState(code)
 
@@ -248,6 +249,7 @@ func (h *Hub) Run() {
 			h.resetPlayerState(request.Client)
 			request.Client.Name = h.buildUniquePlayerName(request.Code, request.Name, request.Client)
 			h.moveClientToRoom(request.Client, request.Code)
+			log.Printf("client joined room: code=%s client=%s", request.Code, request.Client.ID)
 			request.Response <- nil
 			h.broadcastRoomState(request.Code)
 
@@ -418,6 +420,7 @@ func (h *Hub) startGame(client *Client, question questionsvc.Question) error {
 		AnswerCorrectBy: answerCorrectBy,
 	}
 
+	log.Printf("game started: room=%s question=%s", roomCode, question.ID)
 	h.broadcastQuestion(roomCode, roomState.CurrentQuestion)
 	h.broadcastGameState(roomCode)
 	return nil

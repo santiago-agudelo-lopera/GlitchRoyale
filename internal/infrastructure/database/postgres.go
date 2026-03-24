@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -15,7 +16,12 @@ import (
 const databasePingTimeout = 5 * time.Second
 
 func NewPostgresDB() (*sql.DB, error) {
-	_ = godotenv.Load()
+	if err := godotenv.Load(); err != nil {
+		var pathErr *os.PathError
+		if !errors.As(err, &pathErr) {
+			return nil, fmt.Errorf("failed to load .env: %w", err)
+		}
+	}
 
 	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	if databaseURL == "" {
