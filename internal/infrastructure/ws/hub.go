@@ -18,21 +18,22 @@ const (
 	initialPlayerHP     = 100
 	initialPlayerTokens = 0
 	answerRewardTokens  = 10
+	incorrectAnswerHP   = 10
 	attackCostTokens    = 5
 	attackDamageHP      = 20
 )
 
 var (
-	ErrRoomNotFound          = errors.New("room not found")
-	ErrClientNotInRoom       = errors.New("client not in room")
-	ErrNoActiveQuestion      = errors.New("no active question")
-	ErrAnswerAlreadySent     = errors.New("answer already sent")
-	ErrInvalidAnswerOption   = errors.New("invalid answer option")
-	ErrNotEnoughTokens       = errors.New("not enough tokens")
-	ErrTargetNotFound        = errors.New("target not found")
-	ErrCannotAttackYourself  = errors.New("cannot attack yourself")
-	ErrPlayerAlreadyDefeated = errors.New("player already defeated")
-	ErrGameAlreadyFinished   = errors.New("game already finished")
+	ErrRoomNotFound               = errors.New("room not found")
+	ErrClientNotInRoom            = errors.New("client not in room")
+	ErrNoActiveQuestion           = errors.New("no active question")
+	ErrNotEnoughTokens            = errors.New("not enough tokens")
+	ErrTargetNotFound             = errors.New("target not found")
+	ErrCannotAttackYourself       = errors.New("cannot attack yourself")
+	ErrPlayerAlreadyDefeated      = errors.New("player already defeated")
+	ErrGameAlreadyFinished        = errors.New("game already finished")
+	ErrTurnContinuationNotAllowed = errors.New("turn continuation not allowed")
+	ErrCountdownAlreadyRunning    = errors.New("countdown already running")
 )
 
 type Player struct {
@@ -50,11 +51,44 @@ type RoomJoinedMessage struct {
 	YourID  string   `json:"yourId"`
 }
 
+type StartGameEventMessage struct {
+	Type     string `json:"type"`
+	RoomCode string `json:"roomCode"`
+}
+
+type CountdownMessage struct {
+	Type     string `json:"type"`
+	RoomCode string `json:"roomCode"`
+	Value    int    `json:"value"`
+}
+
 type GameOverMessage struct {
 	Type     string `json:"type"`
 	RoomCode string `json:"roomCode"`
 	WinnerID string `json:"winnerId"`
 	LoserID  string `json:"loserId"`
+}
+
+type QuestionLockedMessage struct {
+	Type       string `json:"type"`
+	RoomCode   string `json:"roomCode"`
+	AnsweredBy string `json:"answeredBy"`
+}
+
+type AnswerResultGlobalMessage struct {
+	Type        string `json:"type"`
+	RoomCode    string `json:"roomCode"`
+	PlayerID    string `json:"playerId"`
+	PlayerName  string `json:"playerName"`
+	Correct     bool   `json:"correct"`
+	Damage      int    `json:"damage"`
+	RemainingHP int    `json:"remainingHP"`
+}
+
+type PostAttackMessage struct {
+	Type       string `json:"type"`
+	RoomCode   string `json:"roomCode"`
+	AttackerID string `json:"attackerId"`
 }
 
 type QuestionOption struct {
@@ -69,14 +103,17 @@ type RoomQuestion struct {
 	Difficulty      string
 	Options         []QuestionOption
 	AnswerCorrectBy map[string]bool
-	AnsweredPlayers map[string]bool
 }
 
 type RoomGameState struct {
-	CurrentQuestion *RoomQuestion
-	GameOver        bool
-	WinnerID        string
-	LoserID         string
+	CurrentQuestion         *RoomQuestion
+	CurrentQuestionAnswered bool
+	AnsweredByPlayerID      string
+	PendingContinueBy       string
+	CountdownActive         bool
+	GameOver                bool
+	WinnerID                string
+	LoserID                 string
 }
 
 type CreateRoomRequest struct {
@@ -103,6 +140,17 @@ type StartGameRequest struct {
 	Response chan error
 }
 
+type BeginCountdownRequest struct {
+	Client   *Client
+	Response chan error
+}
+
+type ContinueTurnRequest struct {
+	Client   *Client
+	Question questionsvc.Question
+	Response chan error
+}
+
 type SubmitAnswerRequest struct {
 	Client   *Client
 	AnswerID string
@@ -110,9 +158,15 @@ type SubmitAnswerRequest struct {
 }
 
 type AnswerResult struct {
-	Correct bool
-	Tokens  int
-	Err     error
+	Accepted   bool
+	PlayerID   string
+	PlayerName string
+	Correct    bool
+	Tokens     int
+	HP         int
+	Damage     int
+	AnsweredBy string
+	Err        error
 }
 
 type AttackPlayerRequest struct {
@@ -127,32 +181,38 @@ type RoomBroadcast struct {
 }
 
 type Hub struct {
-	Clients       map[*Client]bool
-	Rooms         map[string][]*Client
-	RoomStates    map[string]*RoomGameState
-	Register      chan *Client
-	Unregister    chan *Client
-	CreateRoom    chan CreateRoomRequest
-	JoinRoom      chan JoinRoomRequest
-	StartGame     chan StartGameRequest
-	SubmitAnswer  chan SubmitAnswerRequest
-	AttackPlayer  chan AttackPlayerRequest
-	BroadcastRoom chan RoomBroadcast
+	Clients        map[*Client]bool
+	Rooms          map[string][]*Client
+	RoomStates     map[string]*RoomGameState
+	Register       chan *Client
+	Unregister     chan *Client
+	CreateRoom     chan CreateRoomRequest
+	JoinRoom       chan JoinRoomRequest
+	StartGame      chan StartGameRequest
+	BeginCountdown chan BeginCountdownRequest
+	EndCountdown   chan string
+	ContinueTurn   chan ContinueTurnRequest
+	SubmitAnswer   chan SubmitAnswerRequest
+	AttackPlayer   chan AttackPlayerRequest
+	BroadcastRoom  chan RoomBroadcast
 }
 
 func NewHub() *Hub {
 	return &Hub{
-		Clients:       make(map[*Client]bool),
-		Rooms:         make(map[string][]*Client),
-		RoomStates:    make(map[string]*RoomGameState),
-		Register:      make(chan *Client),
-		Unregister:    make(chan *Client),
-		CreateRoom:    make(chan CreateRoomRequest),
-		JoinRoom:      make(chan JoinRoomRequest),
-		StartGame:     make(chan StartGameRequest),
-		SubmitAnswer:  make(chan SubmitAnswerRequest),
-		AttackPlayer:  make(chan AttackPlayerRequest),
-		BroadcastRoom: make(chan RoomBroadcast),
+		Clients:        make(map[*Client]bool),
+		Rooms:          make(map[string][]*Client),
+		RoomStates:     make(map[string]*RoomGameState),
+		Register:       make(chan *Client),
+		Unregister:     make(chan *Client),
+		CreateRoom:     make(chan CreateRoomRequest),
+		JoinRoom:       make(chan JoinRoomRequest),
+		StartGame:      make(chan StartGameRequest),
+		BeginCountdown: make(chan BeginCountdownRequest),
+		EndCountdown:   make(chan string),
+		ContinueTurn:   make(chan ContinueTurnRequest),
+		SubmitAnswer:   make(chan SubmitAnswerRequest),
+		AttackPlayer:   make(chan AttackPlayerRequest),
+		BroadcastRoom:  make(chan RoomBroadcast),
 	}
 }
 
@@ -193,6 +253,15 @@ func (h *Hub) Run() {
 
 		case request := <-h.StartGame:
 			request.Response <- h.startGame(request.Client, request.Question)
+
+		case request := <-h.BeginCountdown:
+			request.Response <- h.beginCountdown(request.Client)
+
+		case roomCode := <-h.EndCountdown:
+			h.endCountdown(roomCode)
+
+		case request := <-h.ContinueTurn:
+			request.Response <- h.continueTurn(request.Client, request.Question)
 
 		case request := <-h.SubmitAnswer:
 			request.Response <- h.submitAnswer(request.Client, request.AnswerID)
@@ -236,6 +305,33 @@ func (h *Hub) StartGameForClient(client *Client, question questionsvc.Question) 
 	response := make(chan error)
 
 	h.StartGame <- StartGameRequest{
+		Client:   client,
+		Question: question,
+		Response: response,
+	}
+
+	return <-response
+}
+
+func (h *Hub) BeginCountdownForClient(client *Client) error {
+	response := make(chan error)
+
+	h.BeginCountdown <- BeginCountdownRequest{
+		Client:   client,
+		Response: response,
+	}
+
+	return <-response
+}
+
+func (h *Hub) EndCountdownForRoom(roomCode string) {
+	h.EndCountdown <- roomCode
+}
+
+func (h *Hub) ContinueTurnForClient(client *Client, question questionsvc.Question) error {
+	response := make(chan error)
+
+	h.ContinueTurn <- ContinueTurnRequest{
 		Client:   client,
 		Question: question,
 		Response: response,
@@ -309,6 +405,10 @@ func (h *Hub) startGame(client *Client, question questionsvc.Question) error {
 	roomState.GameOver = false
 	roomState.WinnerID = ""
 	roomState.LoserID = ""
+	roomState.CurrentQuestionAnswered = false
+	roomState.AnsweredByPlayerID = ""
+	roomState.PendingContinueBy = ""
+	roomState.CountdownActive = false
 	roomState.CurrentQuestion = &RoomQuestion{
 		ID:              question.ID,
 		Question:        question.Question,
@@ -316,12 +416,58 @@ func (h *Hub) startGame(client *Client, question questionsvc.Question) error {
 		Difficulty:      question.Difficulty,
 		Options:         options,
 		AnswerCorrectBy: answerCorrectBy,
-		AnsweredPlayers: make(map[string]bool),
 	}
 
 	h.broadcastQuestion(roomCode, roomState.CurrentQuestion)
 	h.broadcastGameState(roomCode)
 	return nil
+}
+
+func (h *Hub) beginCountdown(client *Client) error {
+	roomCode := client.RoomCode
+	if roomCode == "" {
+		return ErrClientNotInRoom
+	}
+
+	roomState := h.ensureRoomState(roomCode)
+	if roomState.CountdownActive {
+		return ErrCountdownAlreadyRunning
+	}
+
+	roomState.CountdownActive = true
+	return nil
+}
+
+func (h *Hub) endCountdown(roomCode string) {
+	if roomCode == "" {
+		return
+	}
+
+	roomState, ok := h.RoomStates[roomCode]
+	if !ok {
+		return
+	}
+
+	roomState.CountdownActive = false
+}
+
+func (h *Hub) continueTurn(client *Client, question questionsvc.Question) error {
+	roomCode := client.RoomCode
+	if roomCode == "" {
+		return ErrClientNotInRoom
+	}
+
+	roomState := h.ensureRoomState(roomCode)
+	if roomState.GameOver {
+		return ErrGameAlreadyFinished
+	}
+
+	if roomState.PendingContinueBy == "" || roomState.PendingContinueBy != client.ID {
+		return ErrTurnContinuationNotAllowed
+	}
+
+	roomState.PendingContinueBy = ""
+	return h.startGame(client, question)
 }
 
 func (h *Hub) submitAnswer(client *Client, answerID string) AnswerResult {
@@ -339,22 +485,46 @@ func (h *Hub) submitAnswer(client *Client, answerID string) AnswerResult {
 		return AnswerResult{Err: ErrNoActiveQuestion}
 	}
 
-	if roomState.CurrentQuestion.AnsweredPlayers[client.ID] {
-		return AnswerResult{Err: ErrAnswerAlreadySent}
+	if roomState.CurrentQuestionAnswered {
+		return AnswerResult{Accepted: false, AnsweredBy: roomState.AnsweredByPlayerID}
 	}
 
-	correct, ok := roomState.CurrentQuestion.AnswerCorrectBy[answerID]
-	if !ok {
-		return AnswerResult{Err: ErrInvalidAnswerOption}
-	}
+	roomState.CurrentQuestionAnswered = true
+	roomState.AnsweredByPlayerID = client.ID
+	h.broadcastQuestionLocked(roomCode, client.ID)
 
-	roomState.CurrentQuestion.AnsweredPlayers[client.ID] = true
+	correct := roomState.CurrentQuestion.AnswerCorrectBy[answerID]
+	damage := 0
 	if correct {
 		client.Tokens += answerRewardTokens
+	} else {
+		damage = incorrectAnswerHP
+		client.HP -= incorrectAnswerHP
+		if client.HP < 0 {
+			client.HP = 0
+		}
 	}
 
+	result := AnswerResult{
+		Accepted:   true,
+		PlayerID:   client.ID,
+		PlayerName: client.Name,
+		Correct:    correct,
+		Tokens:     client.Tokens,
+		HP:         client.HP,
+		Damage:     damage,
+	}
+
+	roomState.CurrentQuestion = nil
+	h.broadcastAnswerResult(roomCode, result)
+	h.broadcastAnswerResultGlobal(roomCode, result)
 	h.broadcastGameState(roomCode)
-	return AnswerResult{Correct: correct, Tokens: client.Tokens}
+
+	if client.HP <= 0 {
+		h.finishGame(roomCode, client.ID)
+	}
+
+	return result
 }
 
 func (h *Hub) attackPlayer(client *Client, targetID string) error {
@@ -404,6 +574,7 @@ func (h *Hub) attackPlayer(client *Client, targetID string) error {
 
 	payload, err := json.Marshal(struct {
 		Type         string `json:"type"`
+		RoomCode     string `json:"roomCode"`
 		Attacker     string `json:"attacker"`
 		AttackerName string `json:"attackerName"`
 		Target       string `json:"target"`
@@ -412,6 +583,7 @@ func (h *Hub) attackPlayer(client *Client, targetID string) error {
 		RemainingHP  int    `json:"remainingHP"`
 	}{
 		Type:         "player_attacked",
+		RoomCode:     roomCode,
 		Attacker:     client.ID,
 		AttackerName: client.Name,
 		Target:       target.ID,
@@ -428,8 +600,8 @@ func (h *Hub) attackPlayer(client *Client, targetID string) error {
 
 	if target.HP <= 0 {
 		h.finishGame(roomCode, target.ID)
+		return nil
 	}
-
 	return nil
 }
 
@@ -470,9 +642,6 @@ func (h *Hub) removeClientFromRoom(client *Client) (string, bool) {
 	}
 
 	h.Rooms[roomCode] = updatedClients
-	if roomState, ok := h.RoomStates[roomCode]; ok && roomState.CurrentQuestion != nil {
-		delete(roomState.CurrentQuestion.AnsweredPlayers, client.ID)
-	}
 	return roomCode, true
 }
 
@@ -555,6 +724,101 @@ func (h *Hub) broadcastQuestion(roomCode string, question *RoomQuestion) {
 	})
 	if err != nil {
 		log.Println("error marshalling question:", err)
+		return
+	}
+
+	h.broadcastRawToRoom(roomCode, payload)
+}
+
+func (h *Hub) BroadcastStartGame(roomCode string) {
+	if roomCode == "" {
+		return
+	}
+
+	payload, err := json.Marshal(StartGameEventMessage{
+		Type:     "start_game",
+		RoomCode: roomCode,
+	})
+	if err != nil {
+		log.Println("error marshalling start game event:", err)
+		return
+	}
+
+	h.BroadcastToRoom(roomCode, payload)
+}
+
+func (h *Hub) BroadcastCountdown(roomCode string, value int) {
+	if roomCode == "" {
+		return
+	}
+
+	payload, err := json.Marshal(CountdownMessage{
+		Type:     "countdown",
+		RoomCode: roomCode,
+		Value:    value,
+	})
+	if err != nil {
+		log.Println("error marshalling countdown:", err)
+		return
+	}
+
+	h.BroadcastToRoom(roomCode, payload)
+}
+
+func (h *Hub) broadcastQuestionLocked(roomCode string, answeredBy string) {
+	if roomCode == "" || answeredBy == "" {
+		return
+	}
+
+	payload, err := json.Marshal(QuestionLockedMessage{
+		Type:       "question_locked",
+		RoomCode:   roomCode,
+		AnsweredBy: answeredBy,
+	})
+	if err != nil {
+		log.Println("error marshalling question lock:", err)
+		return
+	}
+
+	h.broadcastRawToRoom(roomCode, payload)
+}
+
+func (h *Hub) broadcastAnswerResult(roomCode string, result AnswerResult) {
+	payload, err := json.Marshal(struct {
+		Type     string `json:"type"`
+		RoomCode string `json:"roomCode"`
+		PlayerID string `json:"playerId"`
+		Correct  bool   `json:"correct"`
+		Tokens   int    `json:"tokens"`
+		HP       int    `json:"hp"`
+	}{
+		Type:     "answer_result",
+		RoomCode: roomCode,
+		PlayerID: result.PlayerID,
+		Correct:  result.Correct,
+		Tokens:   result.Tokens,
+		HP:       result.HP,
+	})
+	if err != nil {
+		log.Println("error marshalling answer result:", err)
+		return
+	}
+
+	h.broadcastRawToRoom(roomCode, payload)
+}
+
+func (h *Hub) broadcastAnswerResultGlobal(roomCode string, result AnswerResult) {
+	payload, err := json.Marshal(AnswerResultGlobalMessage{
+		Type:        "answer_result_global",
+		RoomCode:    roomCode,
+		PlayerID:    result.PlayerID,
+		PlayerName:  result.PlayerName,
+		Correct:     result.Correct,
+		Damage:      result.Damage,
+		RemainingHP: result.HP,
+	})
+	if err != nil {
+		log.Println("error marshalling global answer result:", err)
 		return
 	}
 
@@ -659,6 +923,10 @@ func (h *Hub) finishGame(roomCode string, loserID string) {
 	roomState.WinnerID = winnerID
 	roomState.LoserID = loserID
 	roomState.CurrentQuestion = nil
+	roomState.CurrentQuestionAnswered = false
+	roomState.AnsweredByPlayerID = ""
+	roomState.PendingContinueBy = ""
+	roomState.CountdownActive = false
 
 	h.broadcastGameOver(roomCode, winnerID, loserID)
 }
@@ -666,6 +934,10 @@ func (h *Hub) finishGame(roomCode string, loserID string) {
 func (h *Hub) resetFinishedMatch(roomCode string) {
 	roomState := h.ensureRoomState(roomCode)
 	roomState.CurrentQuestion = nil
+	roomState.CurrentQuestionAnswered = false
+	roomState.AnsweredByPlayerID = ""
+	roomState.PendingContinueBy = ""
+	roomState.CountdownActive = false
 	roomState.GameOver = false
 	roomState.WinnerID = ""
 	roomState.LoserID = ""

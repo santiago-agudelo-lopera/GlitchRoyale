@@ -40,9 +40,12 @@ type RoomCreatedResponse struct {
 }
 
 type AnswerResultResponse struct {
-	Type    string `json:"type"`
-	Correct bool   `json:"correct"`
-	Tokens  int    `json:"tokens"`
+	Type     string `json:"type"`
+	RoomCode string `json:"roomCode"`
+	PlayerID string `json:"playerId"`
+	Correct  bool   `json:"correct"`
+	Tokens   int    `json:"tokens"`
+	HP       int    `json:"hp"`
 }
 
 type ErrorResponse struct {
@@ -189,6 +192,20 @@ func (h *WSHandler) handleStartGame(client *Client) {
 		return
 	}
 
+	roomCode := client.RoomCode
+	if err := h.hub.BeginCountdownForClient(client); err != nil {
+		h.sendError(client, h.mapHubError(err))
+		return
+	}
+	defer h.hub.EndCountdownForRoom(roomCode)
+
+	h.hub.BroadcastStartGame(roomCode)
+
+	for countdown := 3; countdown >= 1; countdown-- {
+		h.hub.BroadcastCountdown(roomCode, countdown)
+		time.Sleep(time.Second)
+	}
+
 	if err := h.hub.StartGameForClient(client, question); err != nil {
 		log.Println("error starting game:", err)
 		h.sendError(client, h.mapHubError(err))
@@ -208,11 +225,9 @@ func (h *WSHandler) handleAnswer(client *Client, answerID string) {
 		return
 	}
 
-	h.sendJSON(client, AnswerResultResponse{
-		Type:    "answer_result",
-		Correct: result.Correct,
-		Tokens:  result.Tokens,
-	})
+	if !result.Accepted {
+		return
+	}
 }
 
 func (h *WSHandler) handleAttack(client *Client, targetID string) {
@@ -235,10 +250,6 @@ func (h *WSHandler) mapHubError(err error) string {
 		return "client_not_in_room"
 	case ErrNoActiveQuestion:
 		return "no_active_question"
-	case ErrAnswerAlreadySent:
-		return "answer_already_sent"
-	case ErrInvalidAnswerOption:
-		return "invalid_answer_option"
 	case ErrNotEnoughTokens:
 		return "not_enough_tokens"
 	case ErrTargetNotFound:
@@ -249,6 +260,10 @@ func (h *WSHandler) mapHubError(err error) string {
 		return "player_already_defeated"
 	case ErrGameAlreadyFinished:
 		return "game_over"
+	case ErrCountdownAlreadyRunning:
+		return "countdown_in_progress"
+	case ErrTurnContinuationNotAllowed:
+		return "turn_continuation_not_allowed"
 	default:
 		return "internal_error"
 	}
